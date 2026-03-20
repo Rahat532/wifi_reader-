@@ -1,13 +1,17 @@
 import math
 import random
+import re
 import socket
 import struct
 import subprocess
 import threading
 import time
 import ipaddress
+import csv
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import pygame
 
@@ -67,6 +71,21 @@ class Device:
 
 devices = {}
 devices_lock = threading.Lock()
+force_scan_event = threading.Event()
+
+router_state = {
+    "reachable": False,
+    "latency_ms": None,
+    "last_checked": 0.0,
+}
+router_state_lock = threading.Lock()
+
+last_action = {
+    "text": "Ready",
+    "ts": 0.0,
+    "color": SOFT_GREEN,
+}
+last_action_lock = threading.Lock()
 
 
 def detect_device_type(mac: str) -> str:
@@ -116,6 +135,91 @@ def ping_host(ip: str, timeout_ms: int = 200) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def ping_host_latency(ip: str, timeout_ms: int = 800):
+    """Ping a host and return (reachable, latency_ms)."""
+    try:
+        result = subprocess.run(
+            ["ping", "-n", "1", "-w", str(timeout_ms), ip],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return False, None
+
+        output = result.stdout or ""
+        match = re.search(r"time[=<](\d+)ms", output, flags=re.IGNORECASE)
+        if match:
+            return True, int(match.group(1))
+
+        # Handles cases like "time<1ms" without a numeric capture from regex.
+        if "time<1ms" in output.lower():
+            return True, 1
+        return True, None
+    except Exception:
+        return False, None
+
+
+def set_action_message(text: str, color=SOFT_GREEN):
+    with last_action_lock:
+        last_action["text"] = text
+        last_action["ts"] = time.time()
+        last_action["color"] = color
+
+
+def open_router_admin():
+    url = f"http://{ROUTER_IP}"
+    try:
+        webbrowser.open(url, new=2)
+        set_action_message(f"Opened router admin: {url}", BLUE)
+    except Exception:
+        set_action_message("Failed to open router admin page", RED)
+
+
+def export_devices_csv(file_name: str = "devices_export.csv"):
+    try:
+        with devices_lock:
+            rows = list(devices.values())
+
+        with open(file_name, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "ip",
+                "mac",
+                "label",
+                "device_type",
+                "signal",
+                "first_seen",
+                "last_seen",
+            ])
+            for dev in rows:
+                writer.writerow([
+                    datetime.now().isoformat(timespec="seconds"),
+                    dev.ip,
+                    dev.mac,
+                    dev.label,
+                    dev.device_type,
+                    dev.strength,
+                    datetime.fromtimestamp(dev.first_seen).isoformat(timespec="seconds"),
+                    datetime.fromtimestamp(dev.last_seen).isoformat(timespec="seconds"),
+                ])
+        set_action_message(f"Exported {len(rows)} devices to {file_name}", SOFT_GREEN)
+    except Exception:
+        set_action_message("Failed to export device list", RED)
+
+
+def router_health_monitor():
+    """Continuously monitor router reachability/latency."""
+    while True:
+        reachable, latency_ms = ping_host_latency(ROUTER_IP, timeout_ms=900)
+        with router_state_lock:
+            router_state["reachable"] = reachable
+            router_state["latency_ms"] = latency_ms
+            router_state["last_checked"] = time.time()
+        time.sleep(5)
 
 
 def iter_network_hosts(cidr: str):
@@ -223,6 +327,8 @@ def network_scan():
 
             with devices_lock:
                 now = time.time()
+                existing_ips = set(devices.keys())
+                found_ips = set(found.keys())
 
                 for ip, info in found.items():
                     if ip in devices:
@@ -247,6 +353,10 @@ def network_scan():
                         new_device.strength_history = [new_device.strength]
                         devices[ip] = new_device
 
+                joined = sorted(found_ips - existing_ips)
+                if joined:
+                    set_action_message(f"New device detected: {joined[0]}", YELLOW)
+
                 # Remove devices not seen recently even when scan returns empty.
                 stale_ips = []
                 for ip, dev in devices.items():
@@ -256,10 +366,15 @@ def network_scan():
                 for ip in stale_ips:
                     del devices[ip]
 
+                if stale_ips:
+                    set_action_message(f"Device left network: {stale_ips[0]}", RED)
+
         except Exception as e:
             print("Scan error:", e)
 
-        time.sleep(SCAN_INTERVAL)
+        # Wait for next interval or a manual scan trigger.
+        force_scan_event.wait(timeout=SCAN_INTERVAL)
+        force_scan_event.clear()
 
 
 def polar_to_cartesian(angle_deg: float, radius: float):
@@ -316,6 +431,56 @@ def draw_radar_background(screen, font_small):
     pygame.draw.rect(screen, RADAR_GREEN, (900, 100, 480, 680), 2, border_radius=12)
     panel_title = pygame.font.SysFont("consolas", 24, bold=True).render("Connected Devices", True, RADAR_GREEN)
     screen.blit(panel_title, (920, 120))
+
+
+def draw_router_controller(screen, font_small):
+    box_x, box_y, box_w, box_h = 40, 100, 340, 250
+    pygame.draw.rect(screen, (5, 22, 18), (box_x, box_y, box_w, box_h), border_radius=12)
+    pygame.draw.rect(screen, RADAR_GREEN, (box_x, box_y, box_w, box_h), 2, border_radius=12)
+
+    title = pygame.font.SysFont("consolas", 20, bold=True).render("Router Controller", True, RADAR_GREEN)
+    screen.blit(title, (box_x + 14, box_y + 12))
+
+    with router_state_lock:
+        reachable = router_state["reachable"]
+        latency_ms = router_state["latency_ms"]
+        last_checked = router_state["last_checked"]
+
+    status_text = "Online" if reachable else "Offline"
+    status_color = (100, 255, 100) if reachable else RED
+    status_line = font_small.render(f"Status: {status_text}", True, status_color)
+    latency_line = font_small.render(
+        f"Latency: {latency_ms} ms" if latency_ms is not None else "Latency: N/A",
+        True,
+        SOFT_GREEN,
+    )
+    age_secs = max(0, int(time.time() - last_checked)) if last_checked else 0
+    checked_line = font_small.render(f"Last check: {age_secs}s ago", True, SOFT_GREEN)
+
+    screen.blit(status_line, (box_x + 16, box_y + 50))
+    screen.blit(latency_line, (box_x + 16, box_y + 74))
+    screen.blit(checked_line, (box_x + 16, box_y + 98))
+
+    controls = [
+        "R: Open router admin page",
+        "P: Ping router now",
+        "N: Manual network rescan",
+        "E: Export devices to CSV",
+    ]
+    y = box_y + 132
+    for line in controls:
+        txt = font_small.render(line, True, WHITE)
+        screen.blit(txt, (box_x + 16, y))
+        y += 24
+
+    with last_action_lock:
+        action_text = last_action["text"]
+        action_ts = last_action["ts"]
+        action_color = last_action["color"]
+
+    if time.time() - action_ts < 8:
+        action_line = font_small.render(f"Action: {action_text[:44]}", True, action_color)
+        screen.blit(action_line, (box_x + 16, box_y + box_h - 26))
 
 
 def draw_sweep(screen, sweep_angle):
@@ -421,6 +586,8 @@ def main():
     # Start scanner thread
     thread = threading.Thread(target=network_scan, daemon=True)
     thread.start()
+    router_thread = threading.Thread(target=router_health_monitor, daemon=True)
+    router_thread.start()
 
     sweep_angle = 0
     running = True
@@ -438,6 +605,7 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     paused = not paused
+                    set_action_message("Paused" if paused else "Resumed", YELLOW)
                 elif event.key == pygame.K_ESCAPE:
                     search_text = ""
                     panel_scroll = 0
@@ -448,6 +616,26 @@ def main():
                     panel_scroll = min(panel_scroll + 1, max_scroll)
                 elif event.key == pygame.K_UP:
                     panel_scroll = max(panel_scroll - 1, 0)
+                elif event.key == pygame.K_r:
+                    open_router_admin()
+                elif event.key == pygame.K_n:
+                    force_scan_event.set()
+                    set_action_message("Manual network scan triggered", BLUE)
+                elif event.key == pygame.K_p:
+                    reachable, latency = ping_host_latency(ROUTER_IP, timeout_ms=900)
+                    with router_state_lock:
+                        router_state["reachable"] = reachable
+                        router_state["latency_ms"] = latency
+                        router_state["last_checked"] = time.time()
+                    if reachable:
+                        set_action_message(
+                            f"Router ping OK ({latency} ms)" if latency is not None else "Router ping OK",
+                            SOFT_GREEN,
+                        )
+                    else:
+                        set_action_message("Router ping failed", RED)
+                elif event.key == pygame.K_e:
+                    export_devices_csv()
                 elif event.unicode.isprintable():
                     search_text += event.unicode
                     panel_scroll = 0
@@ -455,6 +643,7 @@ def main():
                 panel_scroll = max(0, min(panel_scroll - event.y, max_scroll))
 
         draw_radar_background(screen, font_small)
+        draw_router_controller(screen, font_small)
         if not paused:
             draw_sweep(screen, sweep_angle)
         max_scroll = draw_devices(screen, font_small, search_text, paused, panel_scroll)
@@ -466,7 +655,7 @@ def main():
         
         status = "⏸ PAUSED" if paused else "● SCANNING"
         footer = font_small.render(
-            f"Network: {NETWORK_CIDR} | Devices: {device_count} | Status: {status} | SPACE: Pause | ESC: Clear Search | ↑↓/Wheel: Scroll",
+            f"Network: {NETWORK_CIDR} | Devices: {device_count} | Status: {status} | SPACE: Pause | R/P/N/E: Router Controls | ESC: Clear | ↑↓/Wheel: Scroll",
             True,
             SOFT_GREEN
         )
